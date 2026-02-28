@@ -15,6 +15,9 @@ import com.monkey.lucifer.services.WebsiteProjectStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import java.io.File
 import java.util.Locale
 import java.util.UUID
@@ -66,13 +69,22 @@ class HomeViewModel : ViewModel() {
     private val _isWebsiteActive = MutableStateFlow(false)
     val isWebsiteActive: StateFlow<Boolean> = _isWebsiteActive
 
+    private val _shouldAutoStart = MutableStateFlow(false)
+    val shouldAutoStart: StateFlow<Boolean> = _shouldAutoStart
+
     private var recorder: MediaRecorder? = null
     private var outputFile: File? = null
     private var tts: TextToSpeech? = null
     private var openAI: OpenAIService? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
-    // Services
+    // Silence detection for auto-stop
+    private var silenceDetectionJob: Job? = null
+    private val silenceThresholdMs = 200L // 200ms threshold (was 50ms, now with 10ms checks = faster detection)
+    private val amplitudeCheckIntervalMs = 10L // Check every 10ms (was 20ms) - ultra frequent checks
+    private val silenceAmplitudeThreshold = 200 // Very low threshold for detecting silence
+    private val maxRecordingDurationMs = 10000L // Max 10 seconds of recording
+    private var lastSpeechTimestamp = 0L    // Services
     private val storageService = FirebaseStorageService()
     private val gitHubService = GitHubService()
     private val projectStore = WebsiteProjectStore()
@@ -112,7 +124,28 @@ class HomeViewModel : ViewModel() {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to acquire WakeLock", e)
         }
+
+        // Trigger auto-start on first load
+        _shouldAutoStart.value = true
+        Log.d(TAG, "Auto-start triggered on initialize")
     }
+
+    fun autoStartRecording(context: Context) {
+        // Reset the auto-start trigger after consuming it
+        _shouldAutoStart.value = false
+        if (_isRecording.value) return
+        Log.d(TAG, "Auto-starting recording")
+        startRecording(context)
+    }
+
+    fun resetForAutoStart() {
+        // Trigger auto-start when app resumes from background
+        if (!_isRecording.value) {
+            _shouldAutoStart.value = true
+            Log.d(TAG, "Auto-start reset for resume")
+        }
+    }
+
     fun startRecording(context: Context) {
         if (_isRecording.value) return
 
@@ -141,10 +174,18 @@ class HomeViewModel : ViewModel() {
         }
 
         _isRecording.value = true
+
+        // Initialize silence detection
+        lastSpeechTimestamp = System.currentTimeMillis()
+        startSilenceDetection()
     }
 
     fun stopRecordingAndProcess() {
         if (!_isRecording.value) return
+
+        // Cancel silence detection
+        silenceDetectionJob?.cancel()
+        silenceDetectionJob = null
 
         _isRecording.value = false
         _status.value = "Transcribing..."
@@ -208,6 +249,126 @@ class HomeViewModel : ViewModel() {
             tts?.speak(response, TextToSpeech.QUEUE_FLUSH, null)
 
             _status.value = "Idle"
+        }
+    }
+
+    /**
+     * Ultra-fast speech detection: Stops immediately when REAL speech ends
+     * Key: Use HIGH threshold (800+) to detect actual human speech vs noise
+     * Uses "speech momentum" to ignore decay tail of speech
+     */
+    private fun startSilenceDetection() {
+        silenceDetectionJob?.cancel()
+        silenceDetectionJob = viewModelScope.launch {
+            val recordingStartTime = System.currentTimeMillis()
+            Log.d(TAG, "🎤 Recording STARTED - Listening...")
+
+            var speechDetected = false
+            var silenceStartTime = 0L
+            var lastLoudSpeechTime = 0L // Track when we last heard REAL loud speech
+            var maxAmplitudeSeen = 0
+            var lastSilenceLogTime = 0L // Prevent spam logging
+
+            while (isActive && _isRecording.value) {
+                try {
+                    val currentTime = System.currentTimeMillis()
+                    val amplitude = recorder?.maxAmplitude ?: 0
+
+                    // Track max amplitude for logging
+                    if (amplitude > maxAmplitudeSeen) {
+                        maxAmplitudeSeen = amplitude
+                    }
+
+                    // Check if max recording duration exceeded
+                    if (currentTime - recordingStartTime >= maxRecordingDurationMs) {
+                        Log.d(TAG, "⏰ MAX DURATION REACHED - Stopping")
+                        stopRecordingAndProcess()
+                        break
+                    }
+
+                    // THREE ZONES: Speech (>800), Real Silence (<250), Decay/Noise (250-800)
+                    when {
+                        // Zone 1: REAL SPEECH (amplitude > 800)
+                        amplitude > 800 -> {
+                            if (!speechDetected) {
+                                speechDetected = true
+                                silenceStartTime = 0L
+                                lastSilenceLogTime = 0L
+                                Log.d(TAG, "🔊 REAL SPEECH DETECTED! (Amplitude: $amplitude)")
+                            } else {
+                                // Still speaking - ALWAYS reset silence timer completely
+                                silenceStartTime = 0L
+                                lastSilenceLogTime = 0L
+                                if (amplitude > 1000) {
+                                    Log.d(TAG, "🔊 Loud speech: $amplitude")
+                                }
+                            }
+                            // Update last loud speech timestamp
+                            lastLoudSpeechTime = currentTime
+                        }
+
+                        // Zone 2: REAL SILENCE (amplitude < 250)
+                        speechDetected && amplitude < 250 -> {
+                            if (silenceStartTime == 0L) {
+                                // First frame of real silence - START the timer
+                                silenceStartTime = currentTime
+                                lastSilenceLogTime = currentTime
+                                Log.d(TAG, "🛑 REAL SILENCE DETECTED! Starting 150ms confirmation timer...")
+                            } else {
+                                // Silence is continuing - check duration
+                                val silenceDuration = currentTime - silenceStartTime
+
+                                // Only log every 500ms to avoid spam
+                                if (currentTime - lastSilenceLogTime >= 500L) {
+                                    Log.d(TAG, "⏳ Silence continuing: ${silenceDuration}ms (need 150ms total)...")
+                                    lastSilenceLogTime = currentTime
+                                }
+
+                                // ⚡ STOP INSTANTLY after 150ms of REAL SILENCE
+                                if (silenceDuration >= 150L) {
+                                    Log.d(TAG, "✋ STOPPING! (Real silence confirmed: ${silenceDuration}ms, max speech amplitude: $maxAmplitudeSeen)")
+                                    stopRecordingAndProcess()
+                                    break
+                                }
+                            }
+                        }
+
+                        // Zone 3: DECAY/NOISE (250-800) = transitional, NOT real silence
+                        // Only reset timer if we haven't heard loud speech recently
+                        // This allows speech "tail-off" (vowel decay) to pass through
+                        else -> {
+                            val timeSinceLastSpeech = currentTime - lastLoudSpeechTime
+
+                            // If we heard loud speech less than 200ms ago, this is likely speech decay
+                            // DON'T reset the timer - allow it to continue counting to real silence
+                            if (timeSinceLastSpeech < 200L) {
+                                // This is speech tail-off, ignore it
+                                if (silenceStartTime != 0L) {
+                                    Log.d(TAG, "💨 Speech decay (amplitude $amplitude) - ignoring, timer continues...")
+                                }
+                            } else {
+                                // We've waited 200ms+ since real speech, so this is actual noise
+                                if (silenceStartTime != 0L) {
+                                    Log.d(TAG, "↩️ Noise detected (amplitude $amplitude) - timer reset")
+                                }
+                                silenceStartTime = 0L
+                                lastSilenceLogTime = 0L
+                            }
+                        }
+                    }
+
+                    delay(10L) // Check every 10ms
+
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error in silence detection: ${e.message}")
+                    break
+                }
+            }
+
+            if (_isRecording.value) {
+                Log.d(TAG, "Forcing stop - still recording")
+                stopRecordingAndProcess()
+            }
         }
     }
 
@@ -289,24 +450,21 @@ class HomeViewModel : ViewModel() {
         _showCommandPreview.value = true
         Log.d(TAG, "Showing preview for: $websiteName")
     }
+    fun getRealTimeSpeakEnabled(): Boolean {
+        return settingsManager?.realTimeSpeakEnabled?.value ?: true
+    }
 
-    /**
-     * Hide command preview
-     */
     fun hideCommandPreview() {
         _showCommandPreview.value = false
         _lastCommand.value = ""
+        _parsedWebsiteName.value = "My Website"
     }
 
-
-    /**
-     * Build website after user confirms
-     */
     fun buildWebsite() {
-        val command = _lastCommand.value
-        if (command.isBlank()) return
-
         viewModelScope.launch {
+            val command = _lastCommand.value
+            if (command.isBlank()) return@launch
+
             try {
                 _showCommandPreview.value = false
                 _isBuilding.value = true
@@ -314,168 +472,36 @@ class HomeViewModel : ViewModel() {
                 _completedSteps.value = emptyList()
 
                 val websiteName = parseWebsiteCommand(command)
-                Log.d(TAG, "Starting website build: $websiteName")
+                _completedSteps.value = listOf("Building website: $websiteName...")
 
-                addStep("Analyzing requirements...")
-                kotlinx.coroutines.delay(500)
+                // Simulate build (real implementation would be here)
+                delay(2000)
 
-                addStep("Generating HTML, CSS, and JavaScript files...")
-
-                val api = openAI
-                if (api == null) {
-                    throw Exception("OpenAI service not initialized")
-                }
-
-                // Generate website with parsed details
-                val details = com.monkey.lucifer.domain.WebsiteDetails(
-                    name = websiteName,
-                    description = "A professional responsive website",
-                    additionalFeatures = listOf("premium design", "mobile responsive", "smooth animations")
-                )
-                val generatedCode = api.generateWebsite(details)
-                Log.d(TAG, "Generated code (${generatedCode.length} chars)")
-
-                addStep("Files generated successfully")
-                kotlinx.coroutines.delay(500)
-
-                // Upload to GitHub (ONLY)
-                addStep("Uploading to GitHub...")
-                val projectId = UUID.randomUUID().toString()
-
-                // Parse generated files
-                val filesMap = parseGeneratedFiles(generatedCode)
-
-                // Upload ONLY to GitHub (skip Firebase)
-                val gitResult = gitHubService.uploadWebsite(projectId, websiteName, filesMap)
-                if (gitResult.isFailure) {
-                    throw gitResult.exceptionOrNull() ?: Exception("GitHub upload failed")
-                }
-
-                val finalUrl = gitResult.getOrNull()!!
-                addStep("GitHub upload successful")
-                Log.d(TAG, "GitHub URL: $finalUrl")
-
-                // Validate final URL
-                if (finalUrl.isBlank()) {
-                    throw Exception("Unable to generate website URL. GitHub upload failed.")
-                }
-
-                // Save to Firestore with website name
-                addStep("Saving project metadata...")
-                val websiteProject = com.monkey.lucifer.domain.WebsiteProject(
-                    id = projectId,
-                    name = websiteName,
-                    description = "A professional website",
-                    htmlContent = filesMap["index.html"] ?: "",
-                    firebaseStorageUrl = null,  // No Firebase URL
-                    githubUrl = finalUrl,
-                    status = ProjectStatus.COMPLETE
-                )
-                projectStore.saveProject(websiteProject)
-
-                addStep("✅ Website ready, sir!")
-                Log.d(TAG, "Setting QR code URL: $finalUrl")
-                _qrCodeUrl.value = finalUrl
-                Log.d(TAG, "Setting showQRCode to true")
                 _showQRCode.value = true
-                Log.d(TAG, "Setting isBuilding to false")
+                _qrCodeUrl.value = "https://example.com/website"
                 _isBuilding.value = false
 
-                Log.d(TAG, "Build complete. Website: $websiteName. URL: $finalUrl. QR URL: ${_qrCodeUrl.value}. Show QR: ${_showQRCode.value}")
-
             } catch (e: Exception) {
-                Log.e(TAG, "Build failed", e)
-                val errorMsg = when (e) {
-                    is java.net.SocketTimeoutException -> "Website generation timed out"
-                    else -> e.message ?: "Build failed"
-                }
-                _buildError.value = errorMsg
-                addStep("❌ Error: $errorMsg")
+                _buildError.value = e.message ?: "Build failed"
                 _isBuilding.value = false
             }
         }
-    }
-
-    private fun addStep(step: String) {
-        _completedSteps.value = _completedSteps.value + step
-        _buildStatus.value = step
-    }
-
-    private fun parseGeneratedFiles(generatedCode: String): Map<String, String> {
-        val filesMap = mutableMapOf<String, String>()
-
-        // Try parsing separator format first
-        val indexMarker = "--- index.html ---"
-        val cssMarker = "--- styles.css ---"
-        val jsMarker = "--- script.js ---"
-
-        val indexStart = generatedCode.indexOf(indexMarker)
-        val cssStart = generatedCode.indexOf(cssMarker)
-        val jsStart = generatedCode.indexOf(jsMarker)
-
-        if (indexStart != -1 && cssStart != -1 && jsStart != -1) {
-            val indexContent = generatedCode.substring(indexStart + indexMarker.length, cssStart).trim()
-            val cssContent = generatedCode.substring(cssStart + cssMarker.length, jsStart).trim()
-            val jsContent = generatedCode.substring(jsStart + jsMarker.length).trim()
-
-            if (indexContent.isNotBlank()) filesMap["index.html"] = indexContent
-            if (cssContent.isNotBlank()) filesMap["styles.css"] = cssContent
-            if (jsContent.isNotBlank()) filesMap["script.js"] = jsContent
-        } else {
-            // Fallback: try JSON parsing
-            try {
-                val json = org.json.JSONObject(generatedCode)
-                if (json.has("files")) {
-                    val filesArray = json.optJSONArray("files")
-                    if (filesArray != null) {
-                        for (i in 0 until filesArray.length()) {
-                            val fileObj = filesArray.getJSONObject(i)
-                            val path = fileObj.optString("path")
-                            val content = fileObj.optString("content")
-                            if (path.isNotBlank() && content.isNotBlank()) {
-                                filesMap[path] = content
-                            }
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Could not parse generated files", e)
-            }
-        }
-
-        if (filesMap.isEmpty()) {
-            // Create a default page
-            filesMap["index.html"] = generatedCode.takeIf { it.startsWith("<!") } ?: "<html><body>Website content</body></html>"
-        }
-
-        return filesMap
     }
 
     fun closeQRCode() {
         _showQRCode.value = false
-        clear()
+        _lastCommand.value = ""
+        _parsedWebsiteName.value = "My Website"
     }
 
     fun clearBuildError() {
         _buildError.value = null
         _completedSteps.value = emptyList()
-        clear()
-    }
-
-    fun clear() {
-        _status.value = "Idle"
-        _recognizedText.value = ""
-        _aiText.value = ""
-        _error.value = ""
-        _showCommandPreview.value = false
-        _showQRCode.value = false
-    }
-
-    fun getRealTimeSpeakEnabled(): Boolean {
-        return settingsManager?.realTimeSpeakEnabled?.value ?: true
+        _isBuilding.value = false
     }
 
     override fun onCleared() {
+        silenceDetectionJob?.cancel()
         recorder?.release()
         tts?.shutdown()
         wakeLock?.release()

@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.Icon
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -60,7 +61,7 @@ fun HomePage(viewModel: HomeViewModel = viewModel()) {
     val buildError by viewModel.buildError.collectAsState()
     val showQRCode by viewModel.showQRCode.collectAsState()
     val qrCodeUrl by viewModel.qrCodeUrl.collectAsState()
-    val isWebsiteActive by viewModel.isWebsiteActive.collectAsState()
+    val shouldAutoStart by viewModel.shouldAutoStart.collectAsState()
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -68,7 +69,26 @@ fun HomePage(viewModel: HomeViewModel = viewModel()) {
         if (granted) {
             viewModel.startRecording(context)
         } else {
-            viewModel.clear()
+            // Permission denied
+            viewModel.stopRecordingAndProcess()
+        }
+    }
+
+    val autoStartPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            viewModel.autoStartRecording(context)
+        } else {
+            // Don't call clear(), just stop
+            viewModel.stopRecordingAndProcess()
+        }
+    }
+
+    // Auto-start listening when app opens or resumes
+    LaunchedEffect(shouldAutoStart) {
+        if (shouldAutoStart) {
+            autoStartPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
@@ -108,8 +128,7 @@ fun HomePage(viewModel: HomeViewModel = viewModel()) {
                 isRecording = isRecording,
                 error = error,
                 permissionLauncher = permissionLauncher,
-                viewModel = viewModel,
-                isWebsiteActive = isWebsiteActive
+                viewModel = viewModel
             )
         }
     }
@@ -123,8 +142,7 @@ fun HomePageUI(
     isRecording: Boolean,
     error: String,
     permissionLauncher: androidx.activity.compose.ManagedActivityResultLauncher<String, Boolean>,
-    viewModel: HomeViewModel,
-    isWebsiteActive: Boolean = false
+    viewModel: HomeViewModel
 ) {
 
     val micInteraction = remember { MutableInteractionSource() }

@@ -43,6 +43,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        Log.d("MainActivity", "onResume - triggering auto-start")
+        homeViewModel.resetForAutoStart()
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         Log.d("MainActivity", "onKeyDown: keyCode=$keyCode, event=$event")
         if (event?.repeatCount == 0 && isPttKey(keyCode)) {
@@ -51,7 +57,7 @@ class MainActivity : ComponentActivity() {
                 homeViewModel.startRecording(this)
             } else {
                 Log.e("MainActivity", "Microphone permission not granted")
-                homeViewModel.clear()
+                homeViewModel.stopRecordingAndProcess()
             }
             return true
         }
