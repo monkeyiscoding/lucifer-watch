@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">Lucifer AI</string>
+    <string name="hello_world">Lucifer AI Assistant</string>
+    <string name="tile_label">Lucifer AI</string>
+    <string name="complication_label">Lucifer AI Assistant</string>
+    <string name="record">Record</string>
+    <string name="stop">Stop</string>
+    <string name="listening">Listening...</string>
+    <string name="press_to_speak">Press to Speak</string>
+    <string name="you_said">You said:</string>
+</resources>

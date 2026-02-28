@@ -1,0 +1,35 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer circle with red accent -->
+    <path
+        android:pathData="M54,54m-28,0a28,28 0,1 1,56 0a28,28 0,1 1,-56 0"
+        android:fillColor="#FF6B6B"
+        android:fillAlpha="0.3"/>
+
+    <!-- Microphone icon -->
+    <path
+        android:pathData="M54,38C56.2,38 58,39.8 58,42V52C58,54.2 56.2,56 54,56C51.8,56 50,54.2 50,52V42C50,39.8 51.8,38 54,38Z"
+        android:fillColor="#FFFFFF"/>
+
+    <!-- Microphone stand -->
+    <path
+        android:pathData="M44,52C44,57.5 48.5,62 54,62C59.5,62 64,57.5 64,52"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:fillColor="#00000000"/>
+
+    <!-- Microphone base -->
+    <path
+        android:pathData="M54,62V68M48,68H60"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="2.5"
+        android:strokeLineCap="round"/>
+
+    <!-- L letter accent (for Lucifer) -->
+    <path
+        android:pathData="M40,32V28H36V36H44V32Z"
+        android:fillColor="#FF6B6B"/>
+</vector>
