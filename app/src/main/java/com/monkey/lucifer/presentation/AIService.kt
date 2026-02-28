@@ -35,6 +35,9 @@ class OpenAIService(
     private var detectedLanguage: String = "en"
     private val conversationHistory = mutableListOf<ChatMessage>()
 
+    // Expose detected language for TTS
+    fun getDetectedLanguage(): String = detectedLanguage
+
     suspend fun transcribeAudio(audioFile: File): String = withContext(Dispatchers.IO) {
         try {
             val requestBody = MultipartBody.Builder()

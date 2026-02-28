@@ -76,6 +76,7 @@ class HomeViewModel : ViewModel() {
     private var outputFile: File? = null
     private var tts: TextToSpeech? = null
     private var openAI: OpenAIService? = null
+    private var ttsService: TTSService? = null  // OpenAI TTS for better quality
     private var wakeLock: PowerManager.WakeLock? = null
 
     // Silence detection for auto-stop
@@ -104,11 +105,37 @@ class HomeViewModel : ViewModel() {
             _error.value = "Missing OPENAI_API_KEY"
         } else {
             openAI = OpenAIService(apiKey)
+            // Initialize OpenAI TTS service
+            ttsService = TTSService(apiKey, context)
         }
 
         tts = TextToSpeech(context) { status ->
             if (status == TextToSpeech.SUCCESS) {
+                // Default to English, but will be changed per response based on detected language
                 tts?.language = Locale.US
+                Log.d(TAG, "TTS initialized successfully")
+
+                // Log available languages for debugging
+                tts?.availableLanguages?.let { languages ->
+                    val langList = languages.take(10).joinToString(", ") { it.displayName }
+                    Log.d(TAG, "Available TTS languages (first 10): $langList")
+
+                    // Check if Hindi is available
+                    val hindiAvailable = languages.any {
+                        it.language == "hi" || it.displayLanguage.contains("Hindi", ignoreCase = true)
+                    }
+                    Log.d(TAG, "Hindi TTS available: $hindiAvailable")
+
+                    // If Hindi is not available, show helpful message
+                    if (!hindiAvailable) {
+                        Log.w(TAG, "⚠️ Hindi TTS not installed! Install from Watch Settings → Text-to-Speech")
+                    }
+                }
+
+                // Log full list for debugging (can be disabled later)
+                logAvailableTTSLanguages()
+            } else {
+                Log.e(TAG, "TTS initialization failed")
             }
         }
 
@@ -245,8 +272,56 @@ class HomeViewModel : ViewModel() {
             _aiText.value = response
             _status.value = "Speaking..."
 
-            @Suppress("DEPRECATION")
-            tts?.speak(response, TextToSpeech.QUEUE_FLUSH, null)
+            // Set TTS language based on detected language
+            val detectedLang = api.getDetectedLanguage()
+
+            // Use OpenAI TTS for Hindi (better quality), fallback to system TTS for others
+            if (detectedLang.lowercase() in listOf("hi", "hindi")) {
+                Log.d(TAG, "🎤 Using OpenAI TTS for Hindi (Male voice)")
+                ttsService?.speak(response, languageCode = "hi", isMaleVoice = true)
+            } else {
+                Log.d(TAG, "🎤 Using system TTS for $detectedLang")
+
+                val locale = getLocaleForLanguage(detectedLang)
+
+                tts?.let { ttsEngine ->
+                    // Try primary locale first
+                    var result = ttsEngine.setLanguage(locale)
+
+                    // If Hindi failed, try alternative Hindi locales
+                    if ((result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED)
+                        && detectedLang.lowercase() == "hindi") {
+
+                        Log.w(TAG, "Hindi locale $locale not supported, trying alternatives...")
+
+                        // Try Hindi without country code
+                        result = ttsEngine.setLanguage(Locale("hi"))
+                        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                            // Try checking available languages for any Hindi variant
+                            val hindiLocale = ttsEngine.availableLanguages?.firstOrNull {
+                                it.language == "hi"
+                            }
+
+                            if (hindiLocale != null) {
+                                result = ttsEngine.setLanguage(hindiLocale)
+                                Log.d(TAG, "Found Hindi variant: $hindiLocale")
+                            }
+                        }
+                    }
+
+                    // Final fallback to English if all attempts failed
+                    if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                        Log.w(TAG, "Language $detectedLang not supported on this device")
+                        _error.value = "TTS for $detectedLang not installed. Install from Watch Settings → Text-to-Speech"
+                        ttsEngine.setLanguage(Locale.US)
+                    } else {
+                        Log.d(TAG, "✅ TTS language set to: $detectedLang ($locale)")
+                    }
+                }
+
+                @Suppress("DEPRECATION")
+                tts?.speak(response, TextToSpeech.QUEUE_FLUSH, null)
+            }
 
             _status.value = "Idle"
         }
@@ -500,10 +575,69 @@ class HomeViewModel : ViewModel() {
         _isBuilding.value = false
     }
 
+    /**
+     * Maps language codes from Whisper to Android Locale for TTS
+     */
+    private fun getLocaleForLanguage(languageCode: String): Locale {
+        return when (languageCode.lowercase()) {
+            "en", "english" -> Locale.US
+            "hi", "hindi" -> Locale("hi", "IN")  // Hindi (India)
+            "es", "spanish" -> Locale("es", "ES")  // Spanish
+            "fr", "french" -> Locale.FRENCH
+            "de", "german" -> Locale.GERMAN
+            "it", "italian" -> Locale.ITALIAN
+            "ja", "japanese" -> Locale.JAPANESE
+            "ko", "korean" -> Locale.KOREAN
+            "zh", "chinese" -> Locale.CHINESE
+            "pt", "portuguese" -> Locale("pt", "BR")  // Portuguese (Brazil)
+            "ru", "russian" -> Locale("ru", "RU")  // Russian
+            "ar", "arabic" -> Locale("ar", "SA")  // Arabic
+            "bn", "bengali" -> Locale("bn", "IN")  // Bengali
+            "ta", "tamil" -> Locale("ta", "IN")  // Tamil
+            "te", "telugu" -> Locale("te", "IN")  // Telugu
+            "mr", "marathi" -> Locale("mr", "IN")  // Marathi
+            "gu", "gujarati" -> Locale("gu", "IN")  // Gujarati
+            "kn", "kannada" -> Locale("kn", "IN")  // Kannada
+            "ml", "malayalam" -> Locale("ml", "IN")  // Malayalam
+            "pa", "punjabi" -> Locale("pa", "IN")  // Punjabi
+            "ur", "urdu" -> Locale("ur", "PK")  // Urdu
+            "ne", "nepali" -> Locale("ne", "NP")  // Nepali
+            else -> {
+                Log.w(TAG, "Unknown language: $languageCode, falling back to English")
+                Locale.US
+            }
+        }
+    }
+
+    /**
+     * Check if a specific locale is supported by TTS
+     */
+    private fun isLocaleSupportedByTTS(locale: Locale): Boolean {
+        val result = tts?.isLanguageAvailable(locale)
+        return result == TextToSpeech.LANG_AVAILABLE ||
+               result == TextToSpeech.LANG_COUNTRY_AVAILABLE ||
+               result == TextToSpeech.LANG_COUNTRY_VAR_AVAILABLE
+    }
+
+    /**
+     * Diagnostic: Log all available TTS languages
+     */
+    fun logAvailableTTSLanguages() {
+        tts?.availableLanguages?.let { languages ->
+            Log.d(TAG, "═══════════════════════════════════")
+            Log.d(TAG, "Available TTS Languages (${languages.size} total):")
+            languages.sortedBy { it.displayName }.forEach { locale ->
+                Log.d(TAG, "  - ${locale.displayName} (${locale.language}_${locale.country})")
+            }
+            Log.d(TAG, "═══════════════════════════════════")
+        }
+    }
+
     override fun onCleared() {
         silenceDetectionJob?.cancel()
         recorder?.release()
         tts?.shutdown()
+        ttsService?.release()
         wakeLock?.release()
         super.onCleared()
     }
