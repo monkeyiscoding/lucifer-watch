@@ -40,11 +40,14 @@ class OpenAIService(
 
     suspend fun transcribeAudio(audioFile: File): String = withContext(Dispatchers.IO) {
         try {
+            // ✅ FIX: Don't force language hint - let Whisper detect naturally
+            // This allows proper detection of both English and Hindi
             val requestBody = MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("file", audioFile.name,
                     audioFile.asRequestBody("audio/m4a".toMediaType()))
                 .addFormDataPart("model", "whisper-1")
+                // Removed language hint to allow natural detection
                 .addFormDataPart("response_format", "verbose_json")
                 .build()
 
@@ -61,14 +64,41 @@ class OpenAIService(
                 }
 
                 val jsonResponse = JSONObject(response.body?.string() ?: "{}")
-                detectedLanguage = jsonResponse.optString("language", "en")
                 val text = jsonResponse.optString("text", "")
+                val rawLanguage = jsonResponse.optString("language", "en")  // Default to English if not detected
 
-                Log.d("OpenAI", "Detected language: $detectedLanguage")
+                // ✅ STRICT Language Detection: Prioritize script over Whisper detection
+                // This prevents English from being misdetected as Hindi
+                val hasDevanagari = text.any { it in '\u0900'..'\u097F' }  // Devanagari = Hindi
+                val isHindiRaw = rawLanguage.lowercase() in listOf("hi", "hindi")
+                val isUrdu = rawLanguage.lowercase() in listOf("ur", "urdu")  // Treat Urdu as Hindi
+                val isEnglishRaw = rawLanguage.lowercase() in listOf("en", "english")
+
+                detectedLanguage = when {
+                    // PRIORITY 1: If text has Devanagari script, it's definitely Hindi
+                    hasDevanagari -> "hindi"
+                    // PRIORITY 2: If Whisper explicitly says English, trust it
+                    isEnglishRaw -> "english"
+                    // PRIORITY 3: If Whisper says Hindi/Urdu but no Devanagari, check again
+                    isHindiRaw || isUrdu -> {
+                        // Double-check: If Whisper says Hindi but text is pure ASCII/Latin, it's probably English
+                        if (text.all { it.code < 128 || it.isWhitespace() }) {
+                            Log.d("OpenAI", "⚠️ Whisper said Hindi but text is pure ASCII - correcting to English")
+                            "english"
+                        } else {
+                            "hindi"
+                        }
+                    }
+                    // PRIORITY 4: Default to English for safety
+                    else -> "english"
+                }
+
+                Log.d("OpenAI", "Detected Language: $detectedLanguage | Text: '$text' | Whisper: $rawLanguage | HasDevanagari: $hasDevanagari | IsASCII: ${text.all { it.code < 128 || it.isWhitespace() }}")
                 text
             }
         } catch (e: Exception) {
             Log.e("OpenAI", "Transcription error", e)
+            detectedLanguage = "english"
             ""
         }
     }
@@ -359,8 +389,8 @@ Keep responses brief (1-2 sentences max for voice) while maintaining this person
 Remember previous conversation context to provide relevant, contextual responses.
             """.trimIndent()
 
-            val systemPrompt = if (detectedLanguage != "en") {
-                "$lucyferInstruction\n\nRespond in $detectedLanguage."
+            val systemPrompt = if (detectedLanguage == "hindi") {
+                "$lucyferInstruction\n\nRespond in Hindi."
             } else {
                 lucyferInstruction
             }

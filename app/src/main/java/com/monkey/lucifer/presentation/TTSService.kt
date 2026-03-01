@@ -25,9 +25,9 @@ class TTSService(
     private val context: Context
 ) {
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(30, TimeUnit.SECONDS)
+        .connectTimeout(10, TimeUnit.SECONDS)  // Faster connection
+        .readTimeout(20, TimeUnit.SECONDS)     // Reduced read timeout for faster streaming
+        .writeTimeout(10, TimeUnit.SECONDS)    // Faster write timeout
         .retryOnConnectionFailure(true)
         .build()
 
@@ -37,24 +37,11 @@ class TTSService(
     companion object {
         private const val TAG = "TTSService"
 
-        // OpenAI TTS Models and Voices
-        // Models: tts-1 (faster), tts-1-hd (better quality)
-        // Voices for different languages:
-        // - alloy: Neutral, versatile (English focused)
-        // - echo: Deep male voice (English focused)
-        // - fable: Expressive, good for non-English languages
-        // - onyx: Male voice (English focused)
-        // - nova: Warm, female voice (better for Indian languages)
-        // - shimmer: Clear female voice (English focused)
+        // OpenAI TTS Model - Using gpt-4o-mini-tts for faster generation
+        private const val TTS_MODEL = "gpt-4o-mini-tts"  // Fast and high quality
 
-        private const val TTS_MODEL = "tts-1-hd"  // High quality
-
-        // Language-specific voice selection
-        // Hindi needs: nova (warm, natural prosody) or fable (expressive)
-        private const val HINDI_VOICE = "nova"        // Best for Hindi - warm, natural
-        private const val HINDI_VOICE_ALTERNATE = "fable"  // Fallback - expressive
-        private const val DEFAULT_MALE_VOICE = "alloy"     // For other languages
-        private const val DEFAULT_FEMALE_VOICE = "nova"    // For other languages
+        // Voice: alloy (calm, deep, intelligent male voice - perfect for Lucifer)
+        private const val VOICE = "alloy"
 
         private const val API_ENDPOINT = "https://api.openai.com/v1/audio/speech"
     }
@@ -63,8 +50,8 @@ class TTSService(
      * Speak text using OpenAI TTS
      *
      * @param text Text to speak
-     * @param languageCode Language code (e.g., "hi" for Hindi, "en" for English)
-     * @param isMaleVoice Use male voice (true) or female voice (false) - NOTE: OpenAI voices are gender-neutral
+     * @param languageCode Language code (kept for compatibility but not used for voice selection)
+     * @param isMaleVoice Kept for compatibility but always uses alloy voice
      */
     suspend fun speak(
         text: String,
@@ -72,14 +59,14 @@ class TTSService(
         isMaleVoice: Boolean = true
     ) = withContext(Dispatchers.IO) {
         try {
-            Log.d(TAG, "🎤 OpenAI TTS: Speaking in $languageCode (${if (isMaleVoice) "Male" else "Female"})")
+            Log.d(TAG, "🎤 OpenAI TTS: Speaking with Alloy voice")
             Log.d(TAG, "Text: $text")
 
             // Stop any existing playback
             stopSpeaking()
 
             // Get audio from OpenAI TTS
-            val audioBytes = getAudioFromOpenAI(text, languageCode, isMaleVoice)
+            val audioBytes = getAudioFromOpenAI(text)
 
             if (audioBytes == null) {
                 Log.e(TAG, "Failed to get audio from OpenAI TTS")
@@ -102,24 +89,16 @@ class TTSService(
     }
 
     /**
-     * Get audio from OpenAI TTS API
-     * Selects appropriate voice based on language
+     * Get audio from OpenAI TTS API with optimized settings for speed
      */
-    private suspend fun getAudioFromOpenAI(
-        text: String,
-        languageCode: String = "en",
-        isMaleVoice: Boolean = true
-    ): ByteArray? = withContext(Dispatchers.IO) {
+    private suspend fun getAudioFromOpenAI(text: String): ByteArray? = withContext(Dispatchers.IO) {
         try {
-            // Select voice based on language
-            val voice = selectVoiceForLanguage(languageCode, isMaleVoice)
-
             val jsonBody = JSONObject()
             jsonBody.put("model", TTS_MODEL)
             jsonBody.put("input", text)
-            jsonBody.put("voice", voice)
-            jsonBody.put("response_format", "mp3")  // MP3 format for smaller size
-            jsonBody.put("speed", 1.0)  // Normal speed
+            jsonBody.put("voice", VOICE)
+            jsonBody.put("response_format", "mp3")  // MP3 format for smaller size and faster streaming
+            jsonBody.put("speed", 1.15)  // Faster speaking for quicker delivery
 
             val requestBody = jsonBody.toString()
                 .toRequestBody("application/json".toMediaType())
@@ -130,7 +109,7 @@ class TTSService(
                 .post(requestBody)
                 .build()
 
-            Log.d(TAG, "🔊 Calling OpenAI TTS API with voice: $voice for language: $languageCode")
+            Log.d(TAG, "🔊 Calling OpenAI TTS API with $VOICE voice (speed: 1.15x)")
 
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
@@ -149,61 +128,6 @@ class TTSService(
         }
     }
 
-    /**
-     * Select the best voice for a given language
-     *
-     * Voice Selection Strategy:
-     * - Hindi: nova (warm, natural prosody for Indian languages)
-     * - Other languages: alloy (male) or nova (female)
-     */
-    private fun selectVoiceForLanguage(languageCode: String, isMaleVoice: Boolean): String {
-        return when (languageCode.lowercase()) {
-            "hi", "hindi" -> {
-                // Hindi: Use nova for warm, natural accent
-                Log.d(TAG, "🇮🇳 Hindi detected: Using 'nova' voice (warm, natural prosody)")
-                HINDI_VOICE  // nova - best for Hindi
-            }
-            "en", "english" -> {
-                // English: Use alloy for male, nova for female
-                if (isMaleVoice) DEFAULT_MALE_VOICE else DEFAULT_FEMALE_VOICE
-            }
-            "ta", "tamil" -> {
-                // Tamil: Use nova (similar to Hindi)
-                Log.d(TAG, "🇮🇳 Tamil detected: Using 'nova' voice")
-                HINDI_VOICE
-            }
-            "te", "telugu" -> {
-                // Telugu: Use nova (similar to Hindi)
-                Log.d(TAG, "🇮🇳 Telugu detected: Using 'nova' voice")
-                HINDI_VOICE
-            }
-            "gu", "gujarati" -> {
-                // Gujarati: Use nova (similar to Hindi)
-                Log.d(TAG, "🇮🇳 Gujarati detected: Using 'nova' voice")
-                HINDI_VOICE
-            }
-            "mr", "marathi" -> {
-                // Marathi: Use nova (similar to Hindi)
-                Log.d(TAG, "🇮🇳 Marathi detected: Using 'nova' voice")
-                HINDI_VOICE
-            }
-            "pa", "punjabi" -> {
-                // Punjabi: Use nova (similar to Hindi)
-                Log.d(TAG, "🇮🇳 Punjabi detected: Using 'nova' voice")
-                HINDI_VOICE
-            }
-            "bn", "bengali" -> {
-                // Bengali: Use nova (similar to Hindi)
-                Log.d(TAG, "🇮🇳 Bengali detected: Using 'nova' voice")
-                HINDI_VOICE
-            }
-            else -> {
-                // Default: Use alloy for male, nova for female
-                Log.d(TAG, "Default voice selection for: $languageCode")
-                if (isMaleVoice) DEFAULT_MALE_VOICE else DEFAULT_FEMALE_VOICE
-            }
-        }
-    }
 
     /**
      * Play audio file
@@ -240,12 +164,38 @@ class TTSService(
      */
     fun stopSpeaking() {
         try {
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
+            mediaPlayer?.let { player ->
+                if (player.isPlaying) {
+                    player.stop()
+                    Log.d(TAG, "⏹️ MediaPlayer stopped (was playing)")
+                }
+                player.reset()
+                player.release()
+                Log.d(TAG, "⏹️ MediaPlayer released")
+            }
             mediaPlayer = null
-            Log.d(TAG, "⏹️ TTS stopped")
+
+            // Clean up temp file
+            ttsAudioFile?.let { file ->
+                if (file.exists()) {
+                    file.delete()
+                    Log.d(TAG, "🗑️ Deleted temp TTS file: ${file.name}")
+                }
+            }
+            ttsAudioFile = null
+
+            Log.d(TAG, "⏹️ TTS stopped completely")
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping playback: ${e.message}")
+            Log.e(TAG, "Error stopping playback: ${e.message}", e)
+            // Force cleanup even on error
+            try {
+                mediaPlayer?.release()
+                mediaPlayer = null
+                ttsAudioFile?.delete()
+                ttsAudioFile = null
+            } catch (cleanupError: Exception) {
+                Log.e(TAG, "Error in forced cleanup: ${cleanupError.message}")
+            }
         }
     }
 

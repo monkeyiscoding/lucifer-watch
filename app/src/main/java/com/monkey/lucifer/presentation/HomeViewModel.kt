@@ -90,6 +90,7 @@ class HomeViewModel : ViewModel() {
     private val gitHubService = GitHubService()
     private val projectStore = WebsiteProjectStore()
     private var settingsManager: SettingsManager? = null
+    private val pcControl = PCControlService()  // PC Control service
 
     companion object {
         private const val TAG = "HomeViewModel"
@@ -176,9 +177,11 @@ class HomeViewModel : ViewModel() {
     fun startRecording(context: Context) {
         if (_isRecording.value) return
 
-        // Stop any ongoing TTS speech
+        // Stop any ongoing TTS speech (both old TTS and new OpenAI TTS)
         try {
             tts?.stop()
+            ttsService?.stopSpeaking()  // Stop OpenAI TTS immediately
+            Log.d(TAG, "🛑 Stopped all TTS playback")
         } catch (e: Exception) {
             Log.w(TAG, "Failed to stop TTS", e)
         }
@@ -269,59 +272,127 @@ class HomeViewModel : ViewModel() {
                 return@launch
             }
 
-            _aiText.value = response
-            _status.value = "Speaking..."
+            Log.d(TAG, "===== AI RESPONSE START =====")
+            Log.d(TAG, response)
+            Log.d(TAG, "===== AI RESPONSE END =====")
 
-            // Set TTS language based on detected language
-            val detectedLang = api.getDetectedLanguage()
+            // ✅ CHECK FOR PC COMMANDS/QUERIES
+            val pcNicknamePattern = Regex("\\b(?:on|in|to|from)\\s+(?:my\\s+)?([a-z][a-z0-9\\s-]*?)\\s+(?:pc|computer|laptop|desktop)\\b", RegexOption.IGNORE_CASE)
+            val pcMatch = pcNicknamePattern.find(transcript)
 
-            // Use OpenAI TTS for Hindi (better quality), fallback to system TTS for others
-            if (detectedLang.lowercase() in listOf("hi", "hindi")) {
-                Log.d(TAG, "🎤 Using OpenAI TTS for Hindi (Male voice)")
-                ttsService?.speak(response, languageCode = "hi", isMaleVoice = true)
-            } else {
-                Log.d(TAG, "🎤 Using system TTS for $detectedLang")
+            if (pcMatch != null) {
+                val pcNickname = pcMatch.groupValues[1].trim()
+                Log.d(TAG, "PC nickname detected: $pcNickname")
+                Log.d(TAG, "===== PC CONTROL MODE ACTIVATED =====")
 
-                val locale = getLocaleForLanguage(detectedLang)
+                // Extract command or query from AI response
+                var extractedCmd: String? = null
+                var isQuery = false
 
-                tts?.let { ttsEngine ->
-                    // Try primary locale first
-                    var result = ttsEngine.setLanguage(locale)
+                // Pattern 1: "Query: [powershell command]"
+                val queryPattern = Regex("(?:query)\\s*:?\\s*(.+)", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+                queryPattern.find(response)?.let {
+                    extractedCmd = it.groupValues[1].trim()
+                    isQuery = true
+                    Log.d(TAG, "Query pattern matched: $extractedCmd")
+                }
 
-                    // If Hindi failed, try alternative Hindi locales
-                    if ((result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED)
-                        && detectedLang.lowercase() == "hindi") {
-
-                        Log.w(TAG, "Hindi locale $locale not supported, trying alternatives...")
-
-                        // Try Hindi without country code
-                        result = ttsEngine.setLanguage(Locale("hi"))
-                        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                            // Try checking available languages for any Hindi variant
-                            val hindiLocale = ttsEngine.availableLanguages?.firstOrNull {
-                                it.language == "hi"
-                            }
-
-                            if (hindiLocale != null) {
-                                result = ttsEngine.setLanguage(hindiLocale)
-                                Log.d(TAG, "Found Hindi variant: $hindiLocale")
-                            }
-                        }
-                    }
-
-                    // Final fallback to English if all attempts failed
-                    if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                        Log.w(TAG, "Language $detectedLang not supported on this device")
-                        _error.value = "TTS for $detectedLang not installed. Install from Watch Settings → Text-to-Speech"
-                        ttsEngine.setLanguage(Locale.US)
-                    } else {
-                        Log.d(TAG, "✅ TTS language set to: $detectedLang ($locale)")
+                // Pattern 2: "Command: [cmd]" or "CMD: [cmd]"
+                if (extractedCmd == null) {
+                    val cmdPattern = Regex("(?:command|cmd)\\s*:?\\s*(.+)", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+                    cmdPattern.find(response)?.let {
+                        extractedCmd = it.groupValues[1].trim()
+                        isQuery = false
+                        Log.d(TAG, "Command pattern matched: $extractedCmd")
                     }
                 }
 
-                @Suppress("DEPRECATION")
-                tts?.speak(response, TextToSpeech.QUEUE_FLUSH, null)
+                // Clean up the command (remove quotes and trailing text after command)
+                extractedCmd = extractedCmd?.let { cmd ->
+                    cmd.replace("\"\"\"", "\"")
+                       .replace("```", "")
+                       .trim()
+                }
+
+                Log.d(TAG, "Final extracted command: $extractedCmd (isQuery: $isQuery)")
+
+                if (!extractedCmd.isNullOrBlank()) {
+                    // Find the device in Firestore
+                    val device = pcControl.findDeviceByNickname(pcNickname)
+                    Log.d(TAG, "Found device: ${device?.nickname} (${device?.deviceId})")
+
+                    if (device != null) {
+                        // Send command/query to Firestore
+                        Log.d(TAG, "Sending ${if (isQuery) "query" else "command"} to Firestore: $extractedCmd")
+                        val commandId = pcControl.sendCommandToPC(device.deviceId, extractedCmd, isQuery)
+                        Log.d(TAG, "Command send result: ${commandId != null}, ID: $commandId")
+
+                        if (commandId != null) {
+                            // ✅ DISPLAY ONLY THE USER-FRIENDLY PART (before "Command:" or "Query:")
+                            val displayText = when {
+                                response.contains("Command:", ignoreCase = true) -> {
+                                    response.substringBefore("Command:", "").trim()
+                                }
+                                response.contains("Query:", ignoreCase = true) -> {
+                                    response.substringBefore("Query:", "").trim()
+                                }
+                                else -> response
+                            }.ifBlank { response }
+
+                            _aiText.value = displayText
+                            Log.d(TAG, "Display text (command hidden): $displayText")
+
+                            // If it's a query, wait for result
+                            if (isQuery) {
+                                _status.value = "Querying PC..."
+                                val queryResult = pcControl.waitForQueryResult(device.deviceId, commandId, timeout = 30000)
+
+                                if (queryResult != null && queryResult.isNotBlank()) {
+                                    Log.d(TAG, "Query result received: $queryResult")
+                                    // Interpret the result with AI
+                                    val interpretation = api.interpretQueryResult(transcript, queryResult)
+                                    _aiText.value = interpretation
+
+                                    // Speak the interpretation
+                                    val detectedLang = api.getDetectedLanguage()
+                                    ttsService?.speak(interpretation, languageCode = detectedLang, isMaleVoice = true)
+                                } else {
+                                    Log.e(TAG, "Query timed out or failed")
+                                    _aiText.value = displayText
+                                    val detectedLang = api.getDetectedLanguage()
+                                    ttsService?.speak(displayText, languageCode = detectedLang, isMaleVoice = true)
+                                }
+                            } else {
+                                // For commands, just speak the confirmation (command hidden)
+                                val detectedLang = api.getDetectedLanguage()
+                                Log.d(TAG, "🎤 Using OpenAI TTS with Alloy voice for $detectedLang")
+                                ttsService?.speak(displayText, languageCode = detectedLang, isMaleVoice = true)
+                            }
+                        } else {
+                            Log.e(TAG, "Failed to send command to Firestore")
+                            _aiText.value = "Failed to send command to PC, Sir."
+                        }
+                    } else {
+                        Log.e(TAG, "Device not found for nickname: $pcNickname")
+                        _aiText.value = "I couldn't find a PC named '$pcNickname', Sir."
+                    }
+                } else {
+                    Log.w(TAG, "No command extracted from AI response")
+                    _aiText.value = response
+                }
+
+                _status.value = "Idle"
+                return@launch
             }
+
+            // Regular AI chat (no PC command)
+            _aiText.value = response
+            _status.value = "Speaking..."
+
+            // Use OpenAI TTS for all languages with alloy voice
+            val detectedLang = api.getDetectedLanguage()
+            Log.d(TAG, "🎤 Using OpenAI TTS with Alloy voice for $detectedLang")
+            ttsService?.speak(response, languageCode = detectedLang, isMaleVoice = true)
 
             _status.value = "Idle"
         }
